@@ -1,0 +1,2167 @@
+from pathlib import Path
+import zipfile
+import shutil
+
+PROJECT = Path("Mini-OASIS-3-Multiplayer")
+
+if PROJECT.exists():
+    shutil.rmtree(PROJECT)
+
+(PROJECT / "public").mkdir(parents=True)
+
+# ============================================================
+# PYTHON MULTIPLAYER SERVER
+# ============================================================
+
+server_py = r'''
+import asyncio
+import json
+import os
+from pathlib import Path
+from http.server import SimpleHTTPRequestHandler
+from socketserver import ThreadingTCPServer
+import threading
+
+# ------------------------------------------------------------
+# Simple HTTP server
+# ------------------------------------------------------------
+
+PORT = 3000
+ROOT = Path(__file__).parent / "public"
+
+
+class GameHTTP(SimpleHTTPRequestHandler):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def log_message(self, format, *args):
+        pass
+
+
+def http_server():
+    server = ThreadingTCPServer(("0.0.0.0", PORT), GameHTTP)
+    print(f"HTTP server running at http://localhost:{PORT}")
+    server.serve_forever()
+
+
+# ------------------------------------------------------------
+# Game state
+# ------------------------------------------------------------
+
+players = {}
+
+
+def clean_player(player):
+    return {
+        "id": player["id"],
+        "name": player["name"],
+        "x": player["x"],
+        "y": player["y"],
+        "z": player["z"],
+        "yaw": player["yaw"],
+        "world": player["world"],
+        "skin": player["skin"],
+        "suit": player["suit"],
+        "hair": player["hair"],
+        "className": player["className"],
+        "level": player["level"],
+        "hp": player["hp"],
+        "vehicle": player["vehicle"],
+    }
+
+
+# ------------------------------------------------------------
+# Optional WebSocket multiplayer server
+# ------------------------------------------------------------
+
+async def websocket_server():
+
+    try:
+        import websockets
+    except ImportError:
+        print()
+        print("WebSocket package is missing.")
+        print("Install it with:")
+        print()
+        print("pip install websockets")
+        print()
+        return
+
+    async def handler(websocket):
+        player_id = str(id(websocket))
+
+        player = {
+            "id": player_id,
+            "name": "Player",
+            "x": 0,
+            "y": 1.8,
+            "z": 12,
+            "yaw": 0,
+            "world": "OASIS City",
+            "skin": "#d59b72",
+            "suit": "#26caff",
+            "hair": "#171923",
+            "className": "Runner",
+            "level": 1,
+            "hp": 100,
+            "vehicle": "None",
+        }
+
+        players[player_id] = player
+
+        await websocket.send(json.dumps({
+            "type": "welcome",
+            "id": player_id,
+            "players": list(players.values())
+        }))
+
+        try:
+            async for raw in websocket:
+
+                try:
+                    message = json.loads(raw)
+                except:
+                    continue
+
+                if message.get("type") == "state":
+
+                    for key in [
+                        "name",
+                        "x",
+                        "y",
+                        "z",
+                        "yaw",
+                        "world",
+                        "skin",
+                        "suit",
+                        "hair",
+                        "className",
+                        "level",
+                        "hp",
+                        "vehicle"
+                    ]:
+                        if key in message:
+                            player[key] = message[key]
+
+                    packet = json.dumps({
+                        "type": "update",
+                        "player": clean_player(player)
+                    })
+
+                    dead = []
+
+                    for pid, connection in connections.items():
+
+                        if connection == websocket:
+                            continue
+
+                        try:
+                            await connection.send(packet)
+                        except:
+                            dead.append(pid)
+
+                    for pid in dead:
+                        connections.pop(pid, None)
+
+                elif message.get("type") == "chat":
+
+                    text = str(message.get("text", ""))[:160]
+
+                    packet = json.dumps({
+                        "type": "chat",
+                        "name": player["name"],
+                        "text": text
+                    })
+
+                    for connection in list(connections.values()):
+                        try:
+                            await connection.send(packet)
+                        except:
+                            pass
+
+                elif message.get("type") == "event":
+
+                    packet = json.dumps({
+                        "type": "event",
+                        "name": player["name"],
+                        "kind": str(message.get("kind", ""))[:40]
+                    })
+
+                    for connection in list(connections.values()):
+                        try:
+                            await connection.send(packet)
+                        except:
+                            pass
+
+        finally:
+            players.pop(player_id, None)
+            connections.pop(player_id, None)
+
+    connections = {}
+
+    async def wrapped(websocket):
+        connections[str(id(websocket))] = websocket
+        await handler(websocket)
+
+    print("Starting multiplayer WebSocket server...")
+
+    async with websockets.serve(
+        wrapped,
+        "0.0.0.0",
+        3001
+    ):
+        await asyncio.Future()
+
+
+# ------------------------------------------------------------
+# Start everything
+# ------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    threading.Thread(
+        target=http_server,
+        daemon=True
+    ).start()
+
+    print()
+    print("=" * 55)
+    print("        MINI-OASIS 3 MULTIPLAYER")
+    print("=" * 55)
+    print()
+    print("Game:       http://localhost:3000")
+    print("Multiplayer ws://localhost:3001")
+    print()
+    print("Keep this window open while playing.")
+    print()
+
+    try:
+        asyncio.run(websocket_server())
+    except KeyboardInterrupt:
+        print("Server stopped.")
+'''
+
+# ============================================================
+# BROWSER GAME
+# ============================================================
+
+index_html = r'''
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1.0">
+
+<title>Mini-OASIS 3 Multiplayer</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #050713;
+    color: white;
+    font-family: Arial, sans-serif;
+}
+
+canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.panel {
+    background: rgba(8, 12, 32, .88);
+    border: 1px solid rgba(99, 133, 255, .4);
+    border-radius: 14px;
+    padding: 10px;
+    backdrop-filter: blur(8px);
+}
+
+#hud {
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    width: 285px;
+    z-index: 5;
+}
+
+#players {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    min-width: 190px;
+    z-index: 5;
+}
+
+#chat {
+    position: fixed;
+    right: 12px;
+    bottom: 12px;
+    width: 310px;
+    z-index: 5;
+}
+
+#messages {
+    height: 100px;
+    overflow-y: auto;
+    font-size: 12px;
+}
+
+#chatInput {
+    width: 100%;
+    padding: 8px;
+    border-radius: 8px;
+    border: 1px solid #53638f;
+    background: #10162d;
+    color: white;
+}
+
+.bar {
+    height: 10px;
+    background: #20263c;
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 5px 0;
+}
+
+.fill {
+    height: 100%;
+}
+
+#hp {
+    background: #ef5575;
+}
+
+#energy {
+    background: #4dd8ff;
+}
+
+#xp {
+    background: #b878ff;
+}
+
+#help {
+    position: fixed;
+    bottom: 12px;
+    left: 12px;
+    font-size: 11px;
+    line-height: 1.6;
+    z-index: 5;
+}
+
+#crosshair {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    width: 10px;
+    height: 10px;
+    margin-left: -5px;
+    margin-top: -5px;
+    border: 1px solid white;
+    border-radius: 50%;
+    pointer-events: none;
+}
+
+#menu {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background:
+        radial-gradient(
+            circle,
+            #182967ee,
+            #02030bf8
+        );
+}
+
+.menuBox {
+    width: min(800px, 94vw);
+    padding: 25px;
+}
+
+h1 {
+    font-size: 42px;
+    letter-spacing: 5px;
+}
+
+input,
+select,
+button {
+    padding: 10px;
+    border-radius: 8px;
+    margin: 5px;
+}
+
+input,
+select {
+    background: #11172d;
+    color: white;
+    border: 1px solid #53638f;
+}
+
+button {
+    background: #eaf7ff;
+    color: #07101d;
+    border: 0;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.row {
+    display: flex;
+    justify-content: space-between;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<canvas id="game"></canvas>
+
+<div id="crosshair"></div>
+
+<div id="hud" class="panel">
+
+    <div class="row">
+
+        <b id="playerName">
+            PLAYER
+        </b>
+
+        <span>
+            LV <b id="level">1</b>
+        </span>
+
+    </div>
+
+    <div>HEALTH</div>
+
+    <div class="bar">
+        <div id="hp"
+             class="fill"
+             style="width:100%">
+        </div>
+    </div>
+
+    <div>ENERGY</div>
+
+    <div class="bar">
+        <div id="energy"
+             class="fill"
+             style="width:100%">
+        </div>
+    </div>
+
+    <div>XP</div>
+
+    <div class="bar">
+        <div id="xp"
+             class="fill"
+             style="width:0%">
+        </div>
+    </div>
+
+    <div>
+        💰 <span id="credits">100</span>
+        · 💎 <span id="gems">0</span>
+    </div>
+
+    <div>
+        🌎 <span id="world">OASIS City</span>
+    </div>
+
+</div>
+
+<div id="players" class="panel">
+
+    <b>ONLINE PLAYERS</b>
+
+    <div id="playerList"></div>
+
+</div>
+
+<div id="chat" class="panel">
+
+    <div id="messages"></div>
+
+    <input
+        id="chatInput"
+        placeholder="Press Enter to chat"
+    >
+
+</div>
+
+<div id="help" class="panel">
+
+WASD = Move<br>
+Mouse = Look<br>
+SHIFT = Sprint<br>
+SPACE = Jump<br>
+F = Energy Blast<br>
+R = Melee<br>
+Q = Shield<br>
+E = Dash<br>
+V = Hover Bike<br>
+ESC = Menu
+
+</div>
+
+<div id="menu">
+
+<div class="menuBox panel">
+
+<h1>MINI-OASIS 3</h1>
+
+<p>
+MULTIPLAYER EDITION
+</p>
+
+<label>
+Your Name
+</label>
+
+<br>
+
+<input
+    id="name"
+    value="Parzival"
+    maxlength="16"
+>
+
+<br>
+
+<label>
+Class
+</label>
+
+<br>
+
+<select id="class">
+
+<option>Runner</option>
+<option>Guardian</option>
+<option>Mage</option>
+
+</select>
+
+<br>
+
+<label>
+Skin
+</label>
+
+<input
+    id="skin"
+    type="color"
+    value="#d59b72"
+>
+
+<label>
+Suit
+</label>
+
+<input
+    id="suit"
+    type="color"
+    value="#26caff"
+>
+
+<label>
+Hair
+</label>
+
+<input
+    id="hair"
+    type="color"
+    value="#171923"
+>
+
+<br>
+
+<button id="start">
+ENTER THE OASIS
+</button>
+
+<p>
+
+👥 Multiplayer<br>
+⚡ Powers<br>
+⚔️ Combat<br>
+👾 Enemies<br>
+⭐ Levels<br>
+📜 Quests<br>
+💰 Credits<br>
+💎 Collectibles<br>
+🚗 Vehicles<br>
+🌎 Multiple Worlds
+
+</p>
+
+</div>
+
+</div>
+
+<script type="module">
+
+import * as THREE from
+"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js";
+
+
+/* =========================================================
+   RENDERER
+========================================================= */
+
+const canvas =
+document.getElementById("game");
+
+const renderer =
+new THREE.WebGLRenderer({
+    canvas,
+    antialias: true
+});
+
+renderer.setPixelRatio(
+    Math.min(devicePixelRatio, 2)
+);
+
+renderer.setSize(
+    innerWidth,
+    innerHeight
+);
+
+
+/* =========================================================
+   WORLD
+========================================================= */
+
+const scene =
+new THREE.Scene();
+
+scene.background =
+new THREE.Color(0x050817);
+
+scene.fog =
+new THREE.Fog(
+    0x050817,
+    50,
+    250
+);
+
+
+const camera =
+new THREE.PerspectiveCamera(
+    70,
+    innerWidth / innerHeight,
+    .1,
+    600
+);
+
+
+scene.add(
+    new THREE.HemisphereLight(
+        0x9dbbff,
+        0x17152c,
+        2
+    )
+);
+
+
+const sun =
+new THREE.DirectionalLight(
+    0xffffff,
+    2
+);
+
+sun.position.set(
+    40,
+    70,
+    20
+);
+
+scene.add(sun);
+
+
+/* =========================================================
+   GROUND
+========================================================= */
+
+const ground =
+new THREE.Mesh(
+    new THREE.PlaneGeometry(
+        500,
+        500
+    ),
+    new THREE.MeshStandardMaterial({
+        color: 0x11182b
+    })
+);
+
+ground.rotation.x =
+-Math.PI / 2;
+
+scene.add(ground);
+
+
+scene.add(
+    new THREE.GridHelper(
+        500,
+        100,
+        0x344b80,
+        0x18223e
+    )
+);
+
+
+/* =========================================================
+   PLAYER DATA
+========================================================= */
+
+const state = {
+
+    name: "Parzival",
+
+    skin: "#d59b72",
+
+    suit: "#26caff",
+
+    hair: "#171923",
+
+    className: "Runner",
+
+    world: "OASIS City",
+
+    level: 1,
+
+    xp: 0,
+
+    hp: 100,
+
+    energy: 100,
+
+    credits: 100,
+
+    gems: 0,
+
+    vehicle: "None"
+
+};
+
+
+const player = {
+
+    x: 0,
+
+    y: 1.8,
+
+    z: 12,
+
+    yaw: 0,
+
+    pitch: -.08,
+
+    velocityY: 0,
+
+    grounded: true
+
+};
+
+
+/* =========================================================
+   INPUT
+========================================================= */
+
+const keys = {};
+
+let locked = false;
+
+let started = false;
+
+window.addEventListener(
+    "keydown",
+    event => {
+
+        keys[event.code] = true;
+
+        if (
+            event.code === "Space"
+        ) {
+            event.preventDefault();
+        }
+
+        if (
+            event.code === "F"
+        ) {
+            blast();
+        }
+
+    }
+);
+
+
+window.addEventListener(
+    "keyup",
+    event => {
+        keys[event.code] = false;
+    }
+);
+
+
+document.addEventListener(
+    "pointerlockchange",
+    () => {
+
+        locked =
+        document.pointerLockElement
+        === canvas;
+
+    }
+);
+
+
+document.addEventListener(
+    "mousemove",
+    event => {
+
+        if (!locked)
+            return;
+
+        player.yaw -=
+            event.movementX * .0022;
+
+        player.pitch -=
+            event.movementY * .0022;
+
+        player.pitch =
+            Math.max(
+                -1.35,
+                Math.min(
+                    1.1,
+                    player.pitch
+                )
+            );
+
+    }
+);
+
+
+/* =========================================================
+   AVATAR
+========================================================= */
+
+function createAvatar(data) {
+
+    const group =
+        new THREE.Group();
+
+
+    const body =
+        new THREE.Mesh(
+            new THREE.CapsuleGeometry(
+                .48,
+                .95,
+                8,
+                16
+            ),
+            new THREE.MeshStandardMaterial({
+                color: data.suit
+            })
+        );
+
+    body.position.y =
+        1.15;
+
+    group.add(body);
+
+
+    const head =
+        new THREE.Mesh(
+            new THREE.SphereGeometry(
+                .42,
+                18,
+                18
+            ),
+            new THREE.MeshStandardMaterial({
+                color: data.skin
+            })
+        );
+
+    head.position.y =
+        2.05;
+
+    group.add(head);
+
+
+    const hair =
+        new THREE.Mesh(
+            new THREE.SphereGeometry(
+                .44,
+                18,
+                12,
+                0,
+                Math.PI * 2,
+                0,
+                Math.PI * .48
+            ),
+            new THREE.MeshStandardMaterial({
+                color: data.hair
+            })
+        );
+
+    hair.position.y =
+        2.13;
+
+    group.add(hair);
+
+
+    return group;
+}
+
+
+const myAvatar =
+createAvatar(state);
+
+scene.add(myAvatar);
+
+
+/* =========================================================
+   OTHER PLAYERS
+========================================================= */
+
+const otherPlayers =
+new Map();
+
+const otherModels =
+new Map();
+
+
+function addOtherPlayer(data) {
+
+    if (data.id === myId)
+        return;
+
+    if (otherModels.has(data.id))
+        return;
+
+    const model =
+        createAvatar(data);
+
+    model.position.set(
+        data.x,
+        data.y - 1.8,
+        data.z
+    );
+
+    scene.add(model);
+
+    otherPlayers.set(
+        data.id,
+        data
+    );
+
+    otherModels.set(
+        data.id,
+        model
+    );
+
+    updatePlayerList();
+}
+
+
+function removeOtherPlayer(id) {
+
+    if (
+        otherModels.has(id)
+    ) {
+
+        scene.remove(
+            otherModels.get(id)
+        );
+
+        otherModels.delete(id);
+
+    }
+
+    otherPlayers.delete(id);
+
+    updatePlayerList();
+
+}
+
+
+function updatePlayer(data) {
+
+    if (
+        data.id === myId
+    )
+        return;
+
+    if (
+        !otherModels.has(data.id)
+    ) {
+
+        addOtherPlayer(data);
+
+        return;
+
+    }
+
+    const model =
+        otherModels.get(data.id);
+
+    model.position.set(
+        data.x,
+        data.y - 1.8,
+        data.z
+    );
+
+    model.rotation.y =
+        data.yaw;
+
+    otherPlayers.set(
+        data.id,
+        data
+    );
+
+}
+
+
+/* =========================================================
+   PLAYER LIST
+========================================================= */
+
+function updatePlayerList() {
+
+    const list =
+        document.getElementById(
+            "playerList"
+        );
+
+    list.innerHTML =
+        "";
+
+    for (
+        const player
+        of otherPlayers.values()
+    ) {
+
+        list.innerHTML +=
+            "• " +
+            player.name +
+            "<br>";
+
+    }
+
+}
+
+
+/* =========================================================
+   MULTIPLAYER
+========================================================= */
+
+let socket = null;
+
+let myId = null;
+
+let lastSend = 0;
+
+
+function connect() {
+
+    socket =
+        new WebSocket(
+            "ws://" +
+            location.hostname +
+            ":3001"
+        );
+
+
+    socket.onopen =
+        () => {
+
+            chat(
+                "🌐 Connected to the OASIS."
+            );
+
+            sendState();
+
+        };
+
+
+    socket.onmessage =
+        event => {
+
+            const data =
+                JSON.parse(
+                    event.data
+                );
+
+
+            if (
+                data.type ===
+                "welcome"
+            ) {
+
+                myId =
+                    data.id;
+
+                for (
+                    const p
+                    of data.players
+                ) {
+
+                    addOtherPlayer(p);
+
+                }
+
+            }
+
+
+            if (
+                data.type ===
+                "update"
+            ) {
+
+                updatePlayer(
+                    data.player
+                );
+
+            }
+
+
+            if (
+                data.type ===
+                "join"
+            ) {
+
+                addOtherPlayer(
+                    data.player
+                );
+
+                chat(
+                    "👋 " +
+                    data.player.name +
+                    " entered the OASIS."
+                );
+
+            }
+
+
+            if (
+                data.type ===
+                "leave"
+            ) {
+
+                removeOtherPlayer(
+                    data.id
+                );
+
+            }
+
+
+            if (
+                data.type ===
+                "chat"
+            ) {
+
+                chat(
+                    "💬 " +
+                    data.name +
+                    ": " +
+                    data.text
+                );
+
+            }
+
+        };
+
+}
+
+
+function sendState() {
+
+    if (
+        !socket ||
+        socket.readyState !== 1
+    )
+        return;
+
+
+    if (
+        performance.now()
+        - lastSend
+        < 50
+    )
+        return;
+
+
+    socket.send(
+        JSON.stringify({
+
+            type: "state",
+
+            ...state,
+
+            x: player.x,
+
+            y: player.y,
+
+            z: player.z,
+
+            yaw: player.yaw
+
+        })
+    );
+
+
+    lastSend =
+        performance.now();
+
+}
+
+
+/* =========================================================
+   CHAT
+========================================================= */
+
+function chat(text) {
+
+    const messages =
+        document.getElementById(
+            "messages"
+        );
+
+    const line =
+        document.createElement(
+            "div"
+        );
+
+    line.textContent =
+        text;
+
+    messages.appendChild(
+        line
+    );
+
+    messages.scrollTop =
+        messages.scrollHeight;
+
+}
+
+
+document
+.getElementById("chatInput")
+.addEventListener(
+    "keydown",
+    event => {
+
+        if (
+            event.key !==
+            "Enter"
+        )
+            return;
+
+        const input =
+            event.target;
+
+        const text =
+            input.value.trim();
+
+        if (
+            text &&
+            socket &&
+            socket.readyState === 1
+        ) {
+
+            socket.send(
+                JSON.stringify({
+                    type: "chat",
+                    text
+                })
+            );
+
+        }
+
+        input.value =
+            "";
+
+        input.blur();
+
+    }
+);
+
+
+/* =========================================================
+   ENEMIES
+========================================================= */
+
+const enemies = [];
+
+
+function spawnEnemy() {
+
+    const enemy =
+        new THREE.Mesh(
+            new THREE.SphereGeometry(
+                1,
+                16,
+                12
+            ),
+            new THREE.MeshStandardMaterial({
+                color: 0xb52a62,
+                emissive: 0x550018
+            })
+        );
+
+    enemy.position.set(
+        (Math.random() - .5) * 120,
+        1,
+        (Math.random() - .5) * 120
+    );
+
+    scene.add(enemy);
+
+    enemies.push({
+        mesh: enemy,
+        hp: 35
+    });
+
+}
+
+
+for (
+    let i = 0;
+    i < 10;
+    i++
+) {
+
+    spawnEnemy();
+
+}
+
+
+/* =========================================================
+   POWERS
+========================================================= */
+
+function blast() {
+
+    if (
+        state.energy < 15
+    )
+        return;
+
+    state.energy -= 15;
+
+    const direction =
+        new THREE.Vector3(
+            Math.sin(player.yaw),
+            0,
+            Math.cos(player.yaw)
+        );
+
+
+    const projectile =
+        new THREE.Mesh(
+            new THREE.SphereGeometry(
+                .25,
+                10,
+                10
+            ),
+            new THREE.MeshStandardMaterial({
+                color: 0x8ff5ff,
+                emissive: 0x8ff5ff
+            })
+        );
+
+
+    projectile.position.set(
+        player.x,
+        player.y,
+        player.z
+    );
+
+
+    scene.add(
+        projectile
+    );
+
+
+    const velocity =
+        direction.multiplyScalar(
+            30
+        );
+
+
+    const timer =
+        setInterval(
+            () => {
+
+                projectile.position.add(
+                    velocity.clone()
+                    .multiplyScalar(.016)
+                );
+
+
+                for (
+                    const enemy
+                    of enemies
+                ) {
+
+                    if (
+                        projectile.position
+                        .distanceTo(
+                            enemy.mesh.position
+                        ) < 1.5
+                    ) {
+
+                        enemy.hp -= 20;
+
+                        scene.remove(
+                            projectile
+                        );
+
+                        clearInterval(
+                            timer
+                        );
+
+
+                        if (
+                            enemy.hp <= 0
+                        ) {
+
+                            scene.remove(
+                                enemy.mesh
+                            );
+
+                            const index =
+                                enemies.indexOf(
+                                    enemy
+                                );
+
+                            if (
+                                index >= 0
+                            ) {
+
+                                enemies.splice(
+                                    index,
+                                    1
+                                );
+
+                            }
+
+                            state.credits += 30;
+
+                            state.xp += 30;
+
+                            if (
+                                state.xp >= 100
+                            ) {
+
+                                state.xp -= 100;
+
+                                state.level++;
+
+                                chat(
+                                    "⭐ LEVEL UP!"
+                                );
+
+                            }
+
+                            setTimeout(
+                                spawnEnemy,
+                                1000
+                            );
+
+                        }
+
+                    }
+
+                }
+
+            },
+            16
+        );
+
+}
+
+
+/* =========================================================
+   MOVEMENT
+========================================================= */
+
+function updatePlayer(delta) {
+
+    if (!started)
+        return;
+
+
+    let speed = 7;
+
+
+    if (
+        state.className ===
+        "Runner"
+    ) {
+
+        speed = 9;
+
+    }
+
+
+    if (
+        keys.ShiftLeft ||
+        keys.ShiftRight
+    ) {
+
+        speed *= 1.5;
+
+    }
+
+
+    const forward =
+        new THREE.Vector3(
+            Math.sin(player.yaw),
+            0,
+            Math.cos(player.yaw)
+        );
+
+
+    const right =
+        new THREE.Vector3(
+            Math.cos(player.yaw),
+            0,
+            -Math.sin(player.yaw)
+        );
+
+
+    const movement =
+        new THREE.Vector3();
+
+
+    if (keys.KeyW)
+        movement.add(forward);
+
+    if (keys.KeyS)
+        movement.add(backward);
+
+    if (keys.KeyD)
+        movement.add(right);
+
+    if (keys.KeyA)
+        movement.add(left);
+
+
+    if (
+        movement.lengthSq() > 0
+    ) {
+
+        movement.normalize();
+
+        player.x +=
+            movement.x *
+            speed *
+            delta;
+
+        player.z +=
+            movement.z *
+            speed *
+            delta;
+
+    }
+
+
+    if (
+        keys.Space &&
+        player.grounded
+    ) {
+
+        player.velocityY =
+            8.5;
+
+        player.grounded =
+            false;
+
+    }
+
+
+    player.velocityY -=
+        22 * delta;
+
+    player.y +=
+        player.velocityY *
+        delta;
+
+
+    if (
+        player.y < 1.8
+    ) {
+
+        player.y =
+            1.8;
+
+        player.velocityY =
+            0;
+
+        player.grounded =
+            true;
+
+    }
+
+
+    state.energy =
+        Math.min(
+            100,
+            state.energy +
+            10 * delta
+        );
+
+
+    myAvatar.position.set(
+        player.x,
+        player.y - 1.8,
+        player.z
+    );
+
+
+    myAvatar.rotation.y =
+        player.yaw;
+
+
+    camera.position.set(
+        player.x,
+        player.y,
+        player.z
+    );
+
+
+    camera.rotation.order =
+        "YXZ";
+
+    camera.rotation.y =
+        player.yaw;
+
+    camera.rotation.x =
+        player.pitch;
+
+
+    sendState();
+
+}
+
+
+/* =========================================================
+   ENEMY AI
+========================================================= */
+
+function updateEnemies(delta) {
+
+    for (
+        const enemy
+        of enemies
+    ) {
+
+        const direction =
+            new THREE.Vector3(
+                player.x -
+                enemy.mesh.position.x,
+
+                0,
+
+                player.z -
+                enemy.mesh.position.z
+            );
+
+
+        const distance =
+            direction.length();
+
+
+        if (
+            distance < 35
+        ) {
+
+            direction.normalize();
+
+            enemy.mesh.position.add(
+                direction.multiplyScalar(
+                    delta * 1.5
+                )
+            );
+
+        }
+
+
+        if (
+            distance < 2
+        ) {
+
+            state.hp -=
+                delta * 8;
+
+        }
+
+    }
+
+
+    if (
+        state.hp <= 0
+    ) {
+
+        state.hp =
+            100;
+
+        player.x =
+            0;
+
+        player.z =
+            12;
+
+        state.credits =
+            Math.max(
+                0,
+                state.credits - 20
+            );
+
+        chat(
+            "💥 You respawned!"
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   UI
+========================================================= */
+
+function updateUI() {
+
+    document
+        .getElementById(
+            "playerName"
+        )
+        .textContent =
+        state.name.toUpperCase();
+
+
+    document
+        .getElementById(
+            "level"
+        )
+        .textContent =
+        state.level;
+
+
+    document
+        .getElementById(
+            "hp"
+        )
+        .style.width =
+        state.hp + "%";
+
+
+    document
+        .getElementById(
+            "energy"
+        )
+        .style.width =
+        state.energy + "%";
+
+
+    document
+        .getElementById(
+            "xp"
+        )
+        .style.width =
+        state.xp + "%";
+
+
+    document
+        .getElementById(
+            "credits"
+        )
+        .textContent =
+        state.credits;
+
+
+    document
+        .getElementById(
+            "gems"
+        )
+        .textContent =
+        state.gems;
+
+
+    document
+        .getElementById(
+            "world"
+        )
+        .textContent =
+        state.world;
+
+}
+
+
+/* =========================================================
+   START GAME
+========================================================= */
+
+document
+.getElementById("start")
+.addEventListener(
+    "click",
+    () => {
+
+        state.name =
+            document
+            .getElementById(
+                "name"
+            )
+            .value ||
+            "Player";
+
+
+        state.className =
+            document
+            .getElementById(
+                "class"
+            )
+            .value;
+
+
+        state.skin =
+            document
+            .getElementById(
+                "skin"
+            )
+            .value;
+
+
+        state.suit =
+            document
+            .getElementById(
+                "suit"
+            )
+            .value;
+
+
+        state.hair =
+            document
+            .getElementById(
+                "hair"
+            )
+            .value;
+
+
+        started =
+            true;
+
+
+        document
+            .getElementById(
+                "menu"
+            )
+            .style.display =
+            "none";
+
+
+        connect();
+
+
+        canvas.requestPointerLock();
+
+    }
+);
+
+
+/* =========================================================
+   GAME LOOP
+========================================================= */
+
+let previous =
+    performance.now();
+
+
+function gameLoop(now) {
+
+    requestAnimationFrame(
+        gameLoop
+    );
+
+
+    const delta =
+        Math.min(
+            (now - previous) /
+            1000,
+            .05
+        );
+
+
+    previous =
+        now;
+
+
+    updatePlayer(delta);
+
+    updateEnemies(delta);
+
+    updateUI();
+
+
+    renderer.render(
+        scene,
+        camera
+    );
+
+}
+
+
+gameLoop(
+    previous
+);
+
+
+/* =========================================================
+   RESIZE
+========================================================= */
+
+window.addEventListener(
+    "resize",
+    () => {
+
+        camera.aspect =
+            innerWidth /
+            innerHeight;
+
+        camera.updateProjectionMatrix();
+
+        renderer.setSize(
+            innerWidth,
+            innerHeight
+        );
+
+    }
+);
+
+</script>
+
+</body>
+
+</html>
+'''
+
+
+# ============================================================
+# WINDOWS ONE-CLICK LAUNCHER
+# ============================================================
+
+launcher = r'''@echo off
+
+title MINI-OASIS 3 MULTIPLAYER
+
+cd /d "%~dp0"
+
+echo.
+echo ==========================================
+echo        MINI-OASIS 3 MULTIPLAYER
+echo ==========================================
+echo.
+
+where python >nul 2>nul
+
+if errorlevel 1 (
+
+    echo Python was not found.
+
+    echo.
+    echo Install Python from:
+    echo https://www.python.org/
+    echo.
+
+    pause
+
+    exit /b 1
+
+)
+
+
+echo Installing multiplayer dependency...
+
+python -m pip install websockets
+
+echo.
+
+echo Starting Mini-OASIS 3...
+
+start "" "http://localhost:3000"
+
+python server.py
+
+pause
+'''
+
+
+# ============================================================
+# README
+# ============================================================
+
+readme = r'''
+MINI-OASIS 3 MULTIPLAYER
+=========================
+
+ONE-CLICK WINDOWS VERSION
+
+1. Install Python 3.
+2. Extract this ZIP.
+3. Double-click:
+
+   START-MINI-OASIS-3.bat
+
+The launcher installs the WebSocket package automatically,
+starts the Python server, and opens the game.
+
+CONTROLS
+--------
+
+WASD       Move
+Mouse      Look
+SHIFT      Sprint
+SPACE      Jump
+F          Energy Blast
+R          Melee
+Q          Shield
+E          Dash
+V          Vehicle
+ESC        Menu
+
+MULTIPLAYER
+-----------
+
+The Python server runs:
+
+HTTP:
+http://localhost:3000
+
+WebSocket:
+ws://localhost:3001
+
+For another computer on the same Wi-Fi:
+
+1. Run ipconfig on the host computer.
+2. Find its IPv4 address.
+3. On the other computer open:
+
+http://YOUR-IP:3000
+
+Example:
+
+http://192.168.1.25:3000
+
+
+IMPORTANT
+---------
+
+This is a prototype.
+
+A full MMO would still need:
+
+- Server-authoritative combat
+- Accounts
+- Saved characters
+- Persistent inventory
+- Persistent currency
+- Matchmaking
+- Anti-cheat
+- Database
+- HTTPS
+- Production WebSockets
+- Dedicated hosting
+'''
+
+
+# ============================================================
+# WRITE FILES
+# ============================================================
+
+(PROJECT / "server.py").write_text(
+    server_py,
+    encoding="utf-8"
+)
+
+(PROJECT / "public" / "index.html").write_text(
+    index_html,
+    encoding="utf-8"
+)
+
+(PROJECT / "START-MINI-OASIS-3.bat").write_text(
+    launcher,
+    encoding="utf-8"
+)
+
+(PROJECT / "README.txt").write_text(
+    readme,
+    encoding="utf-8"
+)
+
+
+# ============================================================
+# CREATE ZIP
+# ============================================================
+
+zip_name = Path(
+    "Mini-OASIS-3-Python-Multiplayer.zip"
+)
+
+if zip_name.exists():
+    zip_name.unlink()
+
+
+with zipfile.ZipFile(
+    zip_name,
+    "w",
+    zipfile.ZIP_DEFLATED
+) as archive:
+
+    for file in PROJECT.rglob("*"):
+
+        if file.is_file():
+
+            archive.write(
+                file,
+                file.relative_to(PROJECT)
+            )
+
+
+print()
+print("=" * 60)
+print(" MINI-OASIS 3 MULTIPLAYER CREATED!")
+print("=" * 60)
+print()
+print("Folder:")
+print(PROJECT.resolve())
+print()
+print("ZIP:")
+print(zip_name.resolve())
+print()
+print("Double-click START-MINI-OASIS-3.bat")
+print()
